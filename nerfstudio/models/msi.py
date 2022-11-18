@@ -43,16 +43,16 @@ class MSIModelConfig(ModelConfig):
 
     _target: Type = field(default_factory=lambda: MSIModel)
     """target class to instantiate"""
-    h: int = 480
-    w: int = 960
-    nlayers: int = 1
-    nsublayers: int = 1
+    h: int = 960
+    w: int = 1920
+    nlayers: int = 16
+    nsublayers: int = 2
     dmin: float = 2.0
     dmax: float = 20.0
     pose_src: torch.Tensor = torch.eye(4)
     sigmoid_offset: float = 5.0
 
-    loss_coefficients: Dict[str, float] = to_immutable_dict({"rgb_loss": 1.0, "tv_loss": 0.0})
+    loss_coefficients: Dict[str, float] = to_immutable_dict({"rgb_loss": 1.0, "tv_loss": 0.05})
 
 
 class MSI_field(nn.Module):
@@ -96,7 +96,9 @@ class MSI_field(nn.Module):
         )  # (N, R, 2)
 
         # output_vals = torch.zeros((uvs.shape[0], uvs.shape[1], 3))
-        # output_vals[(uvs < 0.0).any(dim=-1)] = torch.tensor([1.0, 0.0, 0.0])
+        # output_vals = (xyzs_normalized + 1) / 2.0
+
+        # # output_vals[(uvs < 0.0).any(dim=-1)] = torch.tensor([1.0, 0.0, 0.0])
 
         # return output_vals
 
@@ -124,7 +126,7 @@ class MSI_field(nn.Module):
 
         # since RGBs are samples at a smaller rate, we will repeat interleave to get the
         # same output shape as the alphas
-        rgbs = rgbs.repeat_interleave(self.nsublayers, dim=0)
+        rgbs = rgbs.repeat_interleave(self.nsublayers, dim=0)  # (R, 3, N, 1)
 
         # accrue alphas over the rays
         weight = misc.cumprod(1 - alphas_sig, exclusive=True) * alphas_sig
@@ -230,9 +232,10 @@ class MSIModel(Model):
         ray_bundle_shape = ray_bundle.shape
 
         ray_bundle = ray_bundle.flatten()
+        # print(ray_bundle_shape, ray_bundle.shape)
 
-        output_vals = self.msi_field(ray_bundle)
-
+        output_vals = self.msi_field(ray_bundle)  # [1, 3, N, 1]
+        output_vals = output_vals.permute(0, 2, 1, 3).squeeze(0).squeeze(-1)
         output_vals = output_vals.reshape(*ray_bundle_shape, 3)
         outputs["rgb"] = output_vals
 
@@ -243,8 +246,11 @@ class MSIModel(Model):
         device = outputs["rgb"].device
         image = batch["image"].to(device)
 
-        print(outputs["rgb"][0])
+        # image = torch.zeros_like(image).to(device)
+        # image[:, 0] = 1.0
+
         rgb_loss = self.rgb_loss(image, outputs["rgb"])  # (N, 3)
+        # print(image.shape, outputs["rgb"].shape)
         tv_loss = self.tv_loss(torch.sigmoid(self.msi_field.rgb)) + self.tv_loss(
             torch.sigmoid(self.msi_field.alpha - self.msi_field.sigmoid_offset)
         )
