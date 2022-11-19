@@ -67,24 +67,39 @@ class MSI_field(nn.Module):
         self.H, self.W = H, W
 
         self.n_total_layers = self.nlayers * self.nsublayers
-        self.planes = 1.0 / torch.linspace(1.0 / self.dmin, 1.0 / self.dmax, self.n_total_layers).cuda()
+
+        self.planes_init = 1.0 / torch.linspace(1.0 / self.dmin, 1.0 / self.dmax, self.n_total_layers).cuda()
+
+        deltas = torch.diff(self.planes_init)
+        self.layer_deltas = Parameter(torch.log(deltas).cuda(), requires_grad=True)
 
         self.sigmoid_offset = sigmoid_offset
 
         self.alpha = Parameter(torch.zeros(self.n_total_layers, 1, H, W).uniform_(-1, 1).cuda(), requires_grad=True)
         self.rgb = Parameter(torch.zeros(self.nlayers, 3, H, W).uniform_(-1, 1).cuda(), requires_grad=True)
 
+    def calculate_radii(self):
+
+        radii = torch.zeros((self.n_total_layers,)).cuda()
+        radii[0] = self.dmin
+
+        radii[1:] = torch.exp(self.layer_deltas)
+
+        return torch.cumsum(radii, dim=0)
+
     def forward(self, ray_bundle: RayBundle):
 
         center_src = self.pose[:3, 3]
 
+        radiis = self.calculate_radii()
+
         # get the intersection (world coords) of each ray with each of the concentric spheres
-        intersections, mask = MSIModel.intersect_rays_with_spheres(ray_bundle, center_src, self.planes)
+        intersections, mask = MSIModel.intersect_rays_with_spheres(ray_bundle, center_src, radiis)
 
         # make them in MSI space
         xyzs = intersections - center_src  # (N, R, 3)
         # normalize by radius
-        xyzs_normalized = xyzs / self.planes.reshape(1, -1, 1)  # (N, R, 3)
+        xyzs_normalized = xyzs / radiis.reshape(1, -1, 1)  # (N, R, 3)
 
         # convert these into uv coordinates (equirectangular projection)
         uvs = torch.stack(
