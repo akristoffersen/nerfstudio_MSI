@@ -270,18 +270,28 @@ class MSIModel(Model):
 
         ray_bundle = ray_bundle.flatten()
 
-        distances = torch.cdist(ray_bundle.origins, self.poses_src[:, :3, 3])  # (N, K)
-        indices = torch.argmin(distances, dim=1)
-        output_vals = torch.zeros((ray_bundle.size, 3)).cuda()
+        if self.config.num_msis == 1:
+            output_vals = self.msi_fields[0](ray_bundle).permute(0, 2, 1, 3).squeeze(0).squeeze(-1)
+        else:
+            distances = torch.cdist(ray_bundle.origins, self.poses_src[:, :3, 3])  # (N, K)
+            probabilities = F.softmax(distances, dim=1)
+            top_k_probs, top_k_indices = torch.topk(probabilities, 2, dim=1)
 
-        for i in range(self.config.num_msis):
-            # create the mask
-            mask = indices == i
-            if mask.any():
-                # evaluate
-                index_outputs = self.msi_fields[i](ray_bundle[mask])
-                # write to outputs
-                output_vals[mask] = index_outputs.permute(0, 2, 1, 3).squeeze(0).squeeze(-1)
+            indices = top_k_indices[:, 1]
+
+            probability_mask = top_k_probs[:, 0] < torch.rand((ray_bundle.size,), device="cuda")
+            indices[probability_mask] = top_k_indices[probability_mask][:, 0]
+
+            output_vals = torch.zeros((ray_bundle.size, 3)).cuda()
+
+            for i in range(self.config.num_msis):
+                # create the mask
+                mask = indices == i
+                if mask.any():
+                    # evaluate
+                    index_outputs = self.msi_fields[i](ray_bundle[mask])
+                    # write to outputs
+                    output_vals[mask] = index_outputs.permute(0, 2, 1, 3).squeeze(0).squeeze(-1)
 
         output_vals = output_vals.reshape(*ray_bundle_shape, 3)
         outputs["rgb"] = output_vals
