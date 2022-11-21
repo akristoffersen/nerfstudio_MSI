@@ -219,13 +219,14 @@ class VanillaPipeline(Pipeline):
         assert self.datamanager.train_dataset is not None, "Missing input dataset"
 
         if isinstance(config.model, MSIModelConfig):
+            dataset_poses = self.datamanager.train_dataset.dataparser_outputs.cameras.camera_to_worlds
+            dataset_centers = dataset_poses[:, :3, 3]
+
             self._model = config.model.setup(
                 scene_box=self.datamanager.train_dataset.dataparser_outputs.scene_box,
                 num_train_data=len(self.datamanager.train_dataset),
                 metadata=self.datamanager.train_dataset.dataparser_outputs.metadata,
-                pose=torch.eye(4),  # poses are centered anyways
-                dmin=1.0,  # hardcoded at the moment
-                dmax=20,  # hardcoded at the moment
+                data_poses=dataset_centers,
             )
         else:
             self._model = config.model.setup(

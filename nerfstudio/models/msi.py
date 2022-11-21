@@ -18,11 +18,13 @@ Implementation of vanilla nerf.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Type
 
 import torch
 import torch.nn.functional as F
+from sklearn.cluster import KMeans
 from torch import nn
 from torch.nn import Parameter
 from torchmetrics import PeakSignalNoiseRatio
@@ -39,17 +41,18 @@ from nerfstudio.utils import misc
 
 @dataclass
 class MSIModelConfig(ModelConfig):
-    """TensoRF model config"""
+    """MSI model config"""
 
     _target: Type = field(default_factory=lambda: MSIModel)
     """target class to instantiate"""
     h: int = 960
     w: int = 1920
+    num_msis: int = 2
     nlayers: int = 16
     nsublayers: int = 2
     dmin: float = 2.0
     dmax: float = 20.0
-    pose_src: torch.Tensor = torch.eye(4)
+    poses_src: torch.Tensor = torch.eye(4).unsqueeze(0)
     sigmoid_offset: float = 5.0
 
     loss_coefficients: Dict[str, float] = to_immutable_dict({"rgb_loss": 1.0, "tv_loss": 0.05})
@@ -71,7 +74,7 @@ class MSI_field(nn.Module):
         self.planes_init = 1.0 / torch.linspace(1.0 / self.dmin, 1.0 / self.dmax, self.n_total_layers).cuda()
 
         deltas = torch.diff(self.planes_init)
-        self.layer_deltas = Parameter(torch.log(deltas).cuda(), requires_grad=True)
+        self.layer_deltas = Parameter(torch.log(deltas).cuda(), requires_grad=False)
 
         self.sigmoid_offset = sigmoid_offset
 
@@ -151,6 +154,12 @@ class MSI_field(nn.Module):
 
         return output_vals
 
+    def calculate_tv_loss(self):
+        tv_loss = total_variation(torch.sigmoid(self.rgb)) + total_variation(
+            torch.sigmoid(self.alpha - self.sigmoid_offset)
+        )
+        return tv_loss
+
 
 class MSIModel(Model):
     """MSI model
@@ -168,10 +177,19 @@ class MSIModel(Model):
         config: MSIModelConfig,
         **kwargs,
     ) -> None:
+
+        input_centers = kwargs["data_poses"]  # (K, 3)
+        kmeans = KMeans(n_clusters=config.num_msis).fit(input_centers)
+        msi_centers = torch.from_numpy(kmeans.cluster_centers_)
+
+        self.poses_src = torch.eye(4).repeat(config.num_msis, 1, 1)
+        self.poses_src[:, :3, 3] = msi_centers
+
+        self.poses_src = self.poses_src.cuda()
+
+        print(msi_centers)
+
         super().__init__(config=config, **kwargs)
-        self.pose = kwargs["pose"].cuda()
-        self.dmin = kwargs["dmin"]
-        self.dmax = kwargs["dmax"]
 
         # H = self.config.h
         # W = self.config.w
@@ -180,16 +198,19 @@ class MSIModel(Model):
         """Set the fields and modules"""
         super().populate_modules()
 
-        self.msi_field = MSI_field(
-            self.config.nlayers,
-            self.config.nsublayers,
-            self.config.dmin,
-            self.config.dmax,
-            self.config.pose_src.cuda(),
-            self.config.h,
-            self.config.w,
-            self.config.sigmoid_offset,
-        )
+        self.msi_fields = [
+            MSI_field(
+                self.config.nlayers,
+                self.config.nsublayers,
+                self.config.dmin,
+                self.config.dmax,
+                self.poses_src[i],
+                self.config.h,
+                self.config.w,
+                self.config.sigmoid_offset,
+            )
+            for i in range(self.config.num_msis)
+        ]
 
         # metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
@@ -200,7 +221,8 @@ class MSIModel(Model):
 
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {}
-        param_groups["planes"] = list(self.msi_field.parameters())
+
+        param_groups["planes"] = list(itertools.chain(*[msi_field.parameters() for msi_field in self.msi_fields]))
         print([param.shape for param in param_groups["planes"]])
 
         return param_groups
@@ -247,10 +269,20 @@ class MSIModel(Model):
         ray_bundle_shape = ray_bundle.shape
 
         ray_bundle = ray_bundle.flatten()
-        # print(ray_bundle_shape, ray_bundle.shape)
 
-        output_vals = self.msi_field(ray_bundle)  # [1, 3, N, 1]
-        output_vals = output_vals.permute(0, 2, 1, 3).squeeze(0).squeeze(-1)
+        distances = torch.cdist(ray_bundle.origins, self.poses_src[:, :3, 3])  # (N, K)
+        indices = torch.argmin(distances, dim=1)
+        output_vals = torch.zeros((ray_bundle.size, 3)).cuda()
+
+        for i in range(self.config.num_msis):
+            # create the mask
+            mask = indices == i
+            if mask.any():
+                # evaluate
+                index_outputs = self.msi_fields[i](ray_bundle[mask])
+                # write to outputs
+                output_vals[mask] = index_outputs.permute(0, 2, 1, 3).squeeze(0).squeeze(-1)
+
         output_vals = output_vals.reshape(*ray_bundle_shape, 3)
         outputs["rgb"] = output_vals
 
@@ -266,9 +298,7 @@ class MSIModel(Model):
 
         rgb_loss = self.rgb_loss(image, outputs["rgb"])  # (N, 3)
         # print(image.shape, outputs["rgb"].shape)
-        tv_loss = self.tv_loss(torch.sigmoid(self.msi_field.rgb)) + self.tv_loss(
-            torch.sigmoid(self.msi_field.alpha - self.msi_field.sigmoid_offset)
-        )
+        tv_loss = sum(msi_field.calculate_tv_loss() for msi_field in self.msi_fields)
 
         loss_dict = {"rgb_loss": rgb_loss, "tv_loss": tv_loss}
 
