@@ -19,6 +19,7 @@ Implementation of vanilla nerf.
 from __future__ import annotations
 
 import itertools
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Type
 
@@ -112,13 +113,6 @@ class MSI_field(nn.Module):
             ],
             dim=2,
         )  # (N, R, 2)
-
-        # output_vals = torch.zeros((uvs.shape[0], uvs.shape[1], 3))
-        # output_vals = (xyzs_normalized + 1) / 2.0
-
-        # # output_vals[(uvs < 0.0).any(dim=-1)] = torch.tensor([1.0, 0.0, 0.0])
-
-        # return output_vals
 
         # sample the alphas
         uvs = uvs.permute(1, 0, 2).unsqueeze(1)  # (R, 1, N, 2)
@@ -262,7 +256,7 @@ class MSIModel(Model):
         intersection = O + D * t0[:, :, None]  # (N, R, 3)
         return intersection, mask  # (N, R, 3)
 
-    def get_outputs(self, ray_bundle: RayBundle):
+    def get_outputs(self, ray_bundle: RayBundle, inference=False):
         # https://diegoinacio.github.io/computer-vision-notebooks-page/pages/ray-intersection_sphere.html
 
         outputs = {}
@@ -274,16 +268,22 @@ class MSIModel(Model):
             output_vals = self.msi_fields[0](ray_bundle).permute(0, 2, 1, 3).squeeze(0).squeeze(-1)
         else:
             distances = torch.cdist(ray_bundle.origins, self.poses_src[:, :3, 3])  # (N, K)
-            probabilities = F.softmax(distances, dim=1)
-            top_k_probs, top_k_indices = torch.topk(probabilities, 2, dim=1)
 
-            indices = top_k_indices[:, 1]
+            if inference:
+                # this means inference
+                indices = torch.argmin(distances, dim=1)
+                if distances.isnan().any():
+                    print("uh oh")
+            else:
+                probabilities = 1 - F.softmax(distances, dim=1)
+                top_k_probs, top_k_indices = torch.topk(probabilities, 2, dim=1)
 
-            probability_mask = top_k_probs[:, 0] < torch.rand((ray_bundle.size,), device="cuda")
-            indices[probability_mask] = top_k_indices[probability_mask][:, 0]
+                indices = top_k_indices[:, 1]
+
+                probability_mask = torch.rand((ray_bundle.size,), device="cuda") < top_k_probs[:, 0]
+                indices[probability_mask] = top_k_indices[probability_mask][:, 0]
 
             output_vals = torch.zeros((ray_bundle.size, 3)).cuda()
-
             for i in range(self.config.num_msis):
                 # create the mask
                 mask = indices == i
@@ -294,9 +294,49 @@ class MSIModel(Model):
                     output_vals[mask] = index_outputs.permute(0, 2, 1, 3).squeeze(0).squeeze(-1)
 
         output_vals = output_vals.reshape(*ray_bundle_shape, 3)
+
         outputs["rgb"] = output_vals
 
         return outputs
+
+    @torch.no_grad()
+    def get_outputs_for_camera_ray_bundle(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+        """Takes in camera parameters and computes the output of the model.
+
+        Args:
+            camera_ray_bundle: ray bundle to calculate outputs over
+        """
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        num_rays = len(camera_ray_bundle)
+        outputs_lists = defaultdict(list)
+        for i in range(0, num_rays, num_rays_per_chunk):
+            start_idx = i
+            end_idx = i + num_rays_per_chunk
+            ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+            outputs = self.forward(ray_bundle=ray_bundle, inference=True)
+            for output_name, output in outputs.items():  # type: ignore
+                outputs_lists[output_name].append(output)
+        outputs = {}
+        for output_name, outputs_list in outputs_lists.items():
+            if not torch.is_tensor(outputs_list[0]):
+                # TODO: handle lists of tensors as well
+                continue
+            outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
+        return outputs
+
+    def forward(self, ray_bundle: RayBundle, inference=False) -> Dict[str, torch.Tensor]:
+        """Run forward starting with a ray bundle. This outputs different things depending on the configuration
+        of the model and whether or not the batch is provided (whether or not we are training basically)
+
+        Args:
+            ray_bundle: containing all the information needed to render that ray latents included
+        """
+
+        if self.collider is not None:
+            ray_bundle = self.collider(ray_bundle)
+
+        return self.get_outputs(ray_bundle, inference=inference)
 
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
         # Scaling metrics by coefficients to create the losses.
