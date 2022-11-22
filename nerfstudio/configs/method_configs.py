@@ -62,15 +62,15 @@ method_configs["nerfacto-msi"] = Config(
     method_name="nerfacto-msi",
     trainer=TrainerConfig(
         steps_per_eval_batch=100,
-        steps_per_save=300000,
-        max_num_iterations=300000,
+        steps_per_save=30000,
+        max_num_iterations=30000,
         mixed_precision=True,
         steps_per_eval_image=3000,
     ),
     pipeline=VanillaPipelineConfig(
         datamanager=VanillaDataManagerConfig(
             dataparser=NerfstudioDataParserConfig(),
-            train_num_rays_per_batch=128096,
+            train_num_rays_per_batch=128096 * 2,
             eval_num_rays_per_batch=32096,
             camera_optimizer=CameraOptimizerConfig(
                 mode="SO3xR3", optimizer=AdamOptimizerConfig(lr=6e-4, eps=1e-8, weight_decay=1e-2)

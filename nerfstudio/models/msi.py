@@ -192,19 +192,21 @@ class MSIModel(Model):
         """Set the fields and modules"""
         super().populate_modules()
 
-        self.msi_fields = [
-            MSI_field(
-                self.config.nlayers,
-                self.config.nsublayers,
-                self.config.dmin,
-                self.config.dmax,
-                self.poses_src[i],
-                self.config.h,
-                self.config.w,
-                self.config.sigmoid_offset,
-            )
-            for i in range(self.config.num_msis)
-        ]
+        self.msi_fields = nn.ModuleList(
+            [
+                MSI_field(
+                    self.config.nlayers,
+                    self.config.nsublayers,
+                    self.config.dmin,
+                    self.config.dmax,
+                    self.poses_src[i],
+                    self.config.h,
+                    self.config.w,
+                    self.config.sigmoid_offset,
+                )
+                for i in range(self.config.num_msis)
+            ]
+        )
 
         # metrics
         self.psnr = PeakSignalNoiseRatio(data_range=1.0)
