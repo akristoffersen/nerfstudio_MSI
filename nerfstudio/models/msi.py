@@ -21,10 +21,13 @@ from __future__ import annotations
 import itertools
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Tuple, Type
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from sklearn.cluster import KMeans
 from torch import nn
 from torch.nn import Parameter
@@ -75,7 +78,7 @@ class MSI_field(nn.Module):
         self.planes_init = 1.0 / torch.linspace(1.0 / self.dmin, 1.0 / self.dmax, self.n_total_layers).cuda()
 
         deltas = torch.diff(self.planes_init)
-        self.layer_deltas = Parameter(torch.log(deltas).cuda(), requires_grad=False)
+        self.layer_deltas = Parameter(torch.log(deltas).cuda(), requires_grad=True)
 
         self.sigmoid_offset = sigmoid_offset
 
@@ -153,6 +156,19 @@ class MSI_field(nn.Module):
             torch.sigmoid(self.alpha - self.sigmoid_offset)
         )
         return tv_loss
+
+    def export(self):
+        export_data = {}
+        export_data["pose"] = self.pose.cpu()
+        export_data["radii"] = self.calculate_radii().cpu()
+
+        alpha = torch.sigmoid(self.alpha - self.sigmoid_offset).permute(0, 2, 3, 1).data.cpu()
+        export_data["alpha"] = alpha
+
+        rgb = torch.sigmoid(self.rgb).permute(0, 2, 3, 1).data.cpu()
+        export_data["rgb"] = rgb
+
+        return export_data
 
 
 class MSIModel(Model):
@@ -350,7 +366,7 @@ class MSIModel(Model):
 
         rgb_loss = self.rgb_loss(image, outputs["rgb"])  # (N, 3)
         # print(image.shape, outputs["rgb"].shape)
-        tv_loss = sum(msi_field.calculate_tv_loss() for msi_field in self.msi_fields)
+        tv_loss = sum(msi_field.calculate_tv_loss() for msi_field in self.msi_fields)  # type: ignore
 
         loss_dict = {"rgb_loss": rgb_loss, "tv_loss": tv_loss}
 
@@ -383,3 +399,33 @@ class MSIModel(Model):
         }
         images_dict = {"img": combined_rgb}
         return metrics_dict, images_dict
+
+    def export_msis(self, output_path: Path):
+
+        for i in range(self.config.num_msis):
+            base_path = output_path / str(i)
+            base_path.mkdir(parents=True)
+
+            msi_exports = self.msi_fields[i].export()  # type: ignore
+
+            with open(base_path / "pose.txt", "w", encoding="utf-8") as f:
+                f.write(",".join(map(str, msi_exports["pose"].tolist()[0])))
+
+            with open(base_path / "radii.txt", "w", encoding="utf-8") as f:
+                f.write(",".join(map(str, msi_exports["radii"].tolist()[0])))
+
+            rgbs = msi_exports["rgb"]
+            base_rgb_path = base_path / "rgbs"
+            base_rgb_path.mkdir()
+            for j, rgb in enumerate(rgbs):
+                rgb = torch.floor(rgb * 256)  # [H, W, 3]
+                rgb_array = rgb.numpy().astype(np.uint8)
+                Image.fromarray(rgb_array).save(base_rgb_path / f"rgb{j}.jpg")
+
+            alphas = msi_exports["alpha"]
+            base_alpha_path = base_path / "alpha"
+            base_alpha_path.mkdir()
+            for j, alpha in enumerate(alphas):
+                alpha = torch.floor(alpha * 256)[..., 0]  # [H, W]
+                alpha_array = alpha.numpy().astype(np.uint8)
+                Image.fromarray(alpha_array).save(base_alpha_path / f"alpha{j}.jpg")
