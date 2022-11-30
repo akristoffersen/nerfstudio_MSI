@@ -34,6 +34,7 @@ from nerfstudio.engine.callbacks import (
     TrainingCallbackLocation,
 )
 from nerfstudio.engine.optimizers import Optimizers, setup_optimizers
+from nerfstudio.models.msi import MSIModelConfig
 from nerfstudio.pipelines.base_pipeline import VanillaPipeline
 from nerfstudio.utils import profiler, writer
 from nerfstudio.utils.decorators import (
@@ -338,6 +339,8 @@ class Trainer:
         if step_check(step, self.config.trainer.steps_per_eval_image):
             with TimeWriter(writer, EventName.TEST_RAYS_PER_SEC, write=False) as test_t:
                 metrics_dict, images_dict = self.pipeline.get_eval_image_metrics_and_images(step=step)
+                if isinstance(self.config.pipeline.model, MSIModelConfig):
+                    self.pipeline.model.export_msis(self.base_dir)  # type: ignore
             writer.put_time(
                 name=EventName.TEST_RAYS_PER_SEC,
                 duration=metrics_dict["num_rays"] / test_t.duration,

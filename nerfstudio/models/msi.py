@@ -111,8 +111,8 @@ class MSI_field(nn.Module):
         # convert these into uv coordinates (equirectangular projection)
         uvs = torch.stack(
             [
-                xyzs_normalized[..., 2],
                 torch.atan2(xyzs_normalized[..., 1], -xyzs_normalized[..., 0]) / (torch.pi),
+                -xyzs_normalized[..., 2],
             ],
             dim=2,
         )  # (N, R, 2)
@@ -386,9 +386,7 @@ class MSIModel(Model):
         rgb = torch.moveaxis(rgb, -1, 0)[None, ...]
 
         psnr = self.psnr(image, rgb)
-        print("test 1")
         ssim = self.ssim(image, rgb)
-        print("test 2")
         # lpips = self.lpips(image, rgb)
         # print("test 3")
 
@@ -404,19 +402,19 @@ class MSIModel(Model):
 
         for i in range(self.config.num_msis):
             base_path = output_path / str(i)
-            base_path.mkdir(parents=True)
+            base_path.mkdir(parents=True, exist_ok=True)
 
             msi_exports = self.msi_fields[i].export()  # type: ignore
 
             with open(base_path / "pose.txt", "w", encoding="utf-8") as f:
-                f.write(",".join(map(str, msi_exports["pose"].tolist()[0])))
+                f.write(",".join(map(str, msi_exports["pose"].flatten().tolist())))
 
             with open(base_path / "radii.txt", "w", encoding="utf-8") as f:
-                f.write(",".join(map(str, msi_exports["radii"].tolist()[0])))
+                f.write(",".join(map(str, msi_exports["radii"].tolist())))
 
             rgbs = msi_exports["rgb"]
             base_rgb_path = base_path / "rgbs"
-            base_rgb_path.mkdir()
+            base_rgb_path.mkdir(exist_ok=True)
             for j, rgb in enumerate(rgbs):
                 rgb = torch.floor(rgb * 256)  # [H, W, 3]
                 rgb_array = rgb.numpy().astype(np.uint8)
@@ -424,7 +422,7 @@ class MSIModel(Model):
 
             alphas = msi_exports["alpha"]
             base_alpha_path = base_path / "alpha"
-            base_alpha_path.mkdir()
+            base_alpha_path.mkdir(exist_ok=True)
             for j, alpha in enumerate(alphas):
                 alpha = torch.floor(alpha * 256)[..., 0]  # [H, W]
                 alpha_array = alpha.numpy().astype(np.uint8)
