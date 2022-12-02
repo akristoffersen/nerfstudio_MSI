@@ -31,6 +31,7 @@ from PIL import Image
 from sklearn.cluster import KMeans
 from torch import nn
 from torch.nn import Parameter
+from torch.nn.functional import softplus
 from torchmetrics import PeakSignalNoiseRatio
 from torchmetrics.functional import structural_similarity_index_measure
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
@@ -51,19 +52,20 @@ class MSIModelConfig(ModelConfig):
     """target class to instantiate"""
     h: int = 960
     w: int = 1920
-    num_msis: int = 2
+    num_msis: int = 1
     nlayers: int = 16
     nsublayers: int = 2
-    dmin: float = 2.0
+    dmin: float = 1.7
     dmax: float = 20.0
     poses_src: torch.Tensor = torch.eye(4).unsqueeze(0)
     sigmoid_offset: float = 5.0
+    learned_radii: bool = True
 
     loss_coefficients: Dict[str, float] = to_immutable_dict({"rgb_loss": 1.0, "tv_loss": 0.05})
 
 
 class MSI_field(nn.Module):
-    def __init__(self, nlayers, nsublayers, dmin, dmax, pose, H, W, sigmoid_offset):
+    def __init__(self, nlayers, nsublayers, dmin, dmax, pose, H, W, sigmoid_offset, learned_radii):
         super().__init__()
         self.nlayers = nlayers
         self.nsublayers = nsublayers
@@ -78,7 +80,7 @@ class MSI_field(nn.Module):
         self.planes_init = 1.0 / torch.linspace(1.0 / self.dmin, 1.0 / self.dmax, self.n_total_layers).cuda()
 
         deltas = torch.diff(self.planes_init)
-        self.layer_deltas = Parameter(torch.log(deltas).cuda(), requires_grad=True)
+        self.layer_deltas = Parameter(torch.log(torch.exp(deltas) - 1).cuda(), requires_grad=learned_radii)
 
         self.sigmoid_offset = sigmoid_offset
 
@@ -86,11 +88,10 @@ class MSI_field(nn.Module):
         self.rgb = Parameter(torch.zeros(self.nlayers, 3, H, W).uniform_(-1, 1).cuda(), requires_grad=True)
 
     def calculate_radii(self):
-
         radii = torch.zeros((self.n_total_layers,)).cuda()
         radii[0] = self.dmin
 
-        radii[1:] = torch.exp(self.layer_deltas)
+        radii[1:] = softplus(self.layer_deltas)
 
         return torch.cumsum(radii, dim=0)
 
@@ -219,6 +220,7 @@ class MSIModel(Model):
                     self.config.h,
                     self.config.w,
                     self.config.sigmoid_offset,
+                    self.config.learned_radii,
                 )
                 for i in range(self.config.num_msis)
             ]
