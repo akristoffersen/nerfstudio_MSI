@@ -19,7 +19,7 @@ TensorRF implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Type, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Type, Literal
 
 import numpy as np
 import torch
@@ -110,6 +110,8 @@ class KPlanesModelConfig(ModelConfig):
     """Proposal loss multiplier."""
     distortion_loss_mult: float = 0.002
     """Distortion loss multiplier."""
+    background_color: Literal["black", "last_sample", "white", "random"] = "black"
+    """The background color that is given to untrained areas. Black seems to do best."""
 
 
 class KPlanesModel(Model):
@@ -161,6 +163,7 @@ class KPlanesModel(Model):
         self.proposal_weights_anneal_max_num_iters = self.config.proposal_weights_anneal_max_num_iters
         self.proposal_weights_anneal_slope = self.config.proposal_weights_anneal_slope
         self.proposal_networks = torch.nn.ModuleList()
+        self.background_color = self.config.background_color
 
         if self.config.use_same_proposal_network:
             assert len(self.proposal_net_args_list) == 1, "Only one proposal network is allowed."
@@ -202,7 +205,7 @@ class KPlanesModel(Model):
         )
 
         # renderers
-        self.renderer_rgb = RGBRenderer(background_color=colors.BLACK)
+        self.renderer_rgb = RGBRenderer(background_color=self.background_color)
         self.renderer_accumulation = AccumulationRenderer()
         self.renderer_depth = DepthRenderer()
 
