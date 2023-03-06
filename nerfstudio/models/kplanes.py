@@ -53,7 +53,7 @@ from nerfstudio.utils import colormaps, colors, misc
 
 
 @dataclass
-class LowrankModelConfig(ModelConfig):
+class KPlanesModelConfig(ModelConfig):
     """K-Planes model config"""
 
     _target: Type = field(default_factory=lambda: KPlanesModel)
@@ -97,6 +97,8 @@ class LowrankModelConfig(ModelConfig):
     # appearance embedding (phototourism)
     use_appearance_embedding: bool = False
     appearance_embedding_dim: int = 0
+    disable_viewing_dependent: bool = False 
+    """If true, color is independent of viewing direction. (Neural Decoder Only)"""
     num_images: Optional[int] = None
     num_proposal_samples_per_ray: Tuple[int, ...] = (256, 96)
     """Number of samples per ray for each proposal network."""
@@ -117,7 +119,7 @@ class KPlanesModel(Model):
         config: K-Planes configuration to instantiate model
     """
 
-    config: LowrankModelConfig
+    config: KPlanesModelConfig
 
     def populate_modules(self):
         """Set the fields and modules"""
@@ -147,6 +149,7 @@ class KPlanesModel(Model):
             linear_decoder=self.linear_decoder,
             linear_decoder_layers=self.linear_decoder_layers,
             num_images=self.num_train_data,
+            disable_viewing_dependent=self.config.disable_viewing_dependent,
         )
 
         self.density_fns = []
@@ -199,7 +202,7 @@ class KPlanesModel(Model):
         )
 
         # renderers
-        self.renderer_rgb = RGBRenderer(background_color=colors.WHITE)
+        self.renderer_rgb = RGBRenderer(background_color=colors.BLACK)
         self.renderer_accumulation = AccumulationRenderer()
         self.renderer_depth = DepthRenderer()
 
