@@ -46,7 +46,7 @@ from nerfstudio.model_components.renderers import (
     DepthRenderer,
     RGBRenderer,
 )
-from nerfstudio.model_components.scene_colliders import AABBBoxCollider
+from nerfstudio.model_components.scene_colliders import AABBBoxCollider, NearFarCollider
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, colors, misc
 
@@ -57,6 +57,10 @@ class KPlanesModelConfig(ModelConfig):
 
     _target: Type = field(default_factory=lambda: KPlanesModel)
     """target class to instantiate"""
+    near_plane: float = 0.05
+    """How far along the ray to start sampling."""
+    far_plane: float = 1000.0
+    """How far along the ray to stop sampling."""
     grid_config: List[Dict] = field(
         default_factory=lambda: [
             {
@@ -128,10 +132,10 @@ class KPlanesModel(Model):
             self.grid_config: Sequence[Dict] = self.config.grid_config
 
         self.concat_features_across_scales = self.config.concat_features_across_scales
-        self.linear_decoder = self.config.linear_decoder
+        linear_decoder = self.config.linear_decoder
         self.linear_decoder_layers = self.config.linear_decoder_layers
 
-        self.scene_contraction = SceneContraction(order=float("inf"))
+        scene_contraction = SceneContraction(order=float("inf"))
 
         self.field = KPlanesField(
             self.scene_box.aabb,
@@ -140,48 +144,37 @@ class KPlanesModel(Model):
             multiscale_res=self.config.multiscale_res,
             use_appearance_embedding=self.config.use_appearance_embedding,
             appearance_dim=self.config.appearance_embedding_dim,
-            spatial_distortion=self.scene_contraction,
-            linear_decoder=self.linear_decoder,
+            spatial_distortion=scene_contraction,
+            linear_decoder=linear_decoder,
             linear_decoder_layers=self.linear_decoder_layers,
             num_images=self.num_train_data,
             disable_viewing_dependent=self.config.disable_viewing_dependent,
         )
 
         self.density_fns = []
-        self.num_proposal_iterations = self.config.num_proposal_iterations
-        self.proposal_net_args_list = self.config.proposal_net_args_list
-        self.proposal_warmup = self.config.proposal_warmup
-        self.proposal_update_every = self.config.proposal_update_every
-        self.use_proposal_weight_anneal = self.config.use_proposal_weight_anneal
-        self.proposal_weights_anneal_max_num_iters = self.config.proposal_weights_anneal_max_num_iters
-        self.proposal_weights_anneal_slope = self.config.proposal_weights_anneal_slope
+        num_prop_nets = self.config.num_proposal_iterations
+        # Build the proposal network(s)
         self.proposal_networks = torch.nn.ModuleList()
-
         if self.config.use_same_proposal_network:
-            assert len(self.proposal_net_args_list) == 1, "Only one proposal network is allowed."
-            prop_net_args = self.proposal_net_args_list[0]
+            assert len(self.config.proposal_net_args_list) == 1, "Only one proposal network is allowed."
+            prop_net_args = self.config.proposal_net_args_list[0]
             network = KPlanesDensityField(
-                self.scene_box.aabb,
-                spatial_distortion=self.scene_contraction,
-                linear_decoder=self.linear_decoder,
-                **prop_net_args,
-            )
+                self.scene_box.aabb, spatial_distortion=scene_contraction,
+                linear_decoder=linear_decoder, **prop_net_args)
             self.proposal_networks.append(network)
-            self.density_fns.extend([network.density_fn for _ in range(self.num_proposal_iterations)])
+            self.density_fns.extend([network.density_fn for _ in range(num_prop_nets)])
         else:
-            for i in range(self.num_proposal_iterations):
-                prop_net_args = self.proposal_net_args_list[min(i, len(self.proposal_net_args_list) - 1)]
+            for i in range(num_prop_nets):
+                prop_net_args = self.config.proposal_net_args_list[min(i, len(self.config.proposal_net_args_list) - 1)]
                 network = KPlanesDensityField(
-                    self.scene_box.aabb,
-                    spatial_distortion=self.scene_contraction,
-                    linear_decoder=self.linear_decoder,
-                    **prop_net_args,
-                )
+                    self.scene_box.aabb, spatial_distortion=scene_contraction,
+                    linear_decoder=linear_decoder, **prop_net_args)
                 self.proposal_networks.append(network)
             self.density_fns.extend([network.density_fn for network in self.proposal_networks])
 
+        # Samplers
         update_schedule = lambda step: np.clip(
-            np.interp(step, [0, self.proposal_warmup], [0, self.proposal_update_every]),
+            np.interp(step, [0, self.config.proposal_warmup], [0, self.config.proposal_update_every]),
             1,
             self.proposal_update_every,
         )
@@ -193,6 +186,9 @@ class KPlanesModel(Model):
             single_jitter=self.config.single_jitter,
             update_sched=update_schedule,
         )
+
+        # Collider
+        self.collider = NearFarCollider(near_plane=self.config.near_plane, far_plane=self.config.far_plane)
 
         # renderers
         self.renderer_rgb = RGBRenderer(background_color=colors.BLACK)
@@ -207,9 +203,12 @@ class KPlanesModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
 
-        # colliders
-        if self.config.enable_collider:
-            self.collider = AABBBoxCollider(scene_box=self.scene_box)
+    def get_param_groups(self) -> Dict[str, List[Parameter]]:
+        param_groups = {
+            "proposal_networks": list(self.proposal_networks.parameters()),
+            "fields": list(self.field.parameters())
+        }
+        return param_groups
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
@@ -241,20 +240,6 @@ class KPlanesModel(Model):
                 )
             )
         return callbacks
-
-    def get_param_groups(self) -> Dict[str, List[Parameter]]:
-
-        model_params = self.field.get_params()
-        pn_params = [pn.get_params() for pn in self.proposal_networks]
-        field_params = model_params["field"] + [p for pnp in pn_params for p in pnp["field"]]
-        nn_params = model_params["nn"] + [p for pnp in pn_params for p in pnp["nn"]]
-        other_params = model_params["other"] + [p for pnp in pn_params for p in pnp["other"]]
-
-        return {
-            "fields": field_params,
-            "nn_params": nn_params,
-            # "other": other_params,
-        }
 
     def get_outputs(self, ray_bundle: RayBundle):
         # uniform sampling
