@@ -260,25 +260,17 @@ class KPlanesModel(Model):
     def get_outputs(self, ray_bundle: RayBundle):
         # uniform sampling
 
-        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(
+            ray_bundle, density_fns=self.density_fns
+        )
         field_out = self.field(ray_samples)
         rgb, density = field_out[FieldHeadNames.RGB], field_out[FieldHeadNames.DENSITY]
-
-        # print("rgb 0", rgb.isnan().any())
-        # print("density 0", density.isnan().any())
 
         weights = ray_samples.get_weights(density)
         weights_list.append(weights)
         ray_samples_list.append(ray_samples)
 
-        rgb = self.renderer_rgb(
-            rgb=rgb,
-            weights=weights,
-        )
-
-        # print("rgb 1", rgb.isnan().any())
-        # print("weights 1", weights.isnan().any())
-
+        rgb = self.renderer_rgb(rgb=rgb, weights=weights)
         accumulation = self.renderer_accumulation(weights)
         depth = self.renderer_depth(weights, ray_samples)
 
@@ -293,35 +285,37 @@ class KPlanesModel(Model):
             outputs["ray_samples_list"] = ray_samples_list
 
         for i in range(self.num_proposal_iterations):
-            outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
+            outputs[f"prop_depth_{i}"] = self.renderer_depth(
+                weights=weights_list[i], ray_samples=ray_samples_list[i]
+            )
 
         return outputs
 
+    def get_metrics_dict(self, outputs, batch):
+        metrics_dict = {}
+        image = batch["image"].to(self.device)
+        metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
+        return metrics_dict
+
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
-        # Scaling metrics by coefficients to create the losses.
         device = outputs["rgb"].device
         image = batch["image"].to(device)
 
         rgb_loss = self.rgb_loss(image, outputs["rgb"])
-
-        # print("rgb_loss", rgb_loss.isnan().any())
-
         loss_dict = {"rgb_loss": rgb_loss}
+        loss_coef = self.config.loss_coefficients
 
         if self.training:
+            if "distortion_loss" in loss_coef:
+                loss_dict["distortion_loss"] = distortion_loss(
+                    outputs["weights_list"], outputs["ray_samples_list"]
+                )
+            if "interlevel_loss" in loss_coef:
+                loss_dict["interlevel_loss"] = interlevel_loss(
+                    outputs["weights_list"], outputs["ray_samples_list"]
+                )
 
-            loss_dict["distortion_loss"] = self.config.distortion_loss_mult * distortion_loss(
-                outputs["weights_list"], outputs["ray_samples_list"]
-            )
-            # print("dist_loss", loss_dict["distortion_loss"].isnan().any())
-
-            loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
-                outputs["weights_list"], outputs["ray_samples_list"]
-            )
-
-            # print("interlevel_loss", loss_dict["interlevel_loss"].isnan().any())
-
-        loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
+        loss_dict = misc.scale_dict(loss_dict, loss_coef)
         return loss_dict
 
     def get_image_metrics_and_images(
