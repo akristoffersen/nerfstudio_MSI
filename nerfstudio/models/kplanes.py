@@ -37,8 +37,7 @@ from nerfstudio.engine.callbacks import (
 )
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SceneContraction
-from nerfstudio.fields.kplanes_density_field import KPlanesDensityField
-from nerfstudio.fields.kplanes_field import KPlanesField
+from nerfstudio.fields.kplanes_field import KPlanesField, KPlanesDensityField
 from nerfstudio.model_components.losses import MSELoss, distortion_loss, interlevel_loss
 from nerfstudio.model_components.ray_samplers import ProposalNetworkSampler
 from nerfstudio.model_components.renderers import (
