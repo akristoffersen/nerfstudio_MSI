@@ -42,12 +42,11 @@ def get_normalized_directions(directions):
     return (directions + 1.0) / 2.0
 
 
-def init_grid_param(grid_nd: int, in_dim: int, out_dim: int, reso: Sequence[int], a: float = 0.1, b: float = 0.5):
+def init_grid_param(in_dim: int, out_dim: int, reso: Sequence[int], a: float = 0.1, b: float = 0.5):
     """TODO"""
     assert in_dim == len(reso), "Resolution must have same number of elements as input-dimension"
     has_time_planes = in_dim == 4
-    assert grid_nd <= in_dim
-    coo_combs = list(itertools.combinations(range(in_dim), grid_nd))
+    coo_combs = list(itertools.combinations(range(in_dim), 2))
     grid_coefs = nn.ParameterList()
     for ci, coo_comb in enumerate(coo_combs):
         new_grid_coef = nn.Parameter(torch.empty(
@@ -65,11 +64,17 @@ def init_grid_param(grid_nd: int, in_dim: int, out_dim: int, reso: Sequence[int]
 def interpolate_kplanes(
     pts: torch.Tensor,
     ms_grids: Collection[Iterable[nn.Module]],
-    grid_dimensions: int,
     concat_features: bool,
 ) -> torch.Tensor:
-    """todo"""
-    coo_combs = list(itertools.combinations(range(pts.shape[-1]), grid_dimensions))
+    """K-Planes: query multi-scale planes at given points
+
+    Args:
+        pts: 3D or 4D points at which the planes are queries
+        ms_grids: Multi-scale k-plane grids
+        concat_features: If true, the features from each scale are concatenated.
+            Otherwise they are summed together.
+    """
+    coo_combs = list(itertools.combinations(range(pts.shape[-1]), 2))
     multi_scale_interp = [] if concat_features else 0.0
     grid: nn.ParameterList
     for scale_id, grid in enumerate(ms_grids):  # type: ignore
@@ -130,7 +135,6 @@ class KPlanesField(Field):
             # Resolution fix: multi-res only on spatial planes
             config["resolution"] = [r * res for r in config["resolution"][:3]] + config["resolution"][3:]
             gp = init_grid_param(
-                grid_nd=config["grid_dimensions"],
                 in_dim=config["input_coordinate_dim"],
                 out_dim=config["output_coordinate_dim"],
                 reso=config["resolution"],
@@ -241,7 +245,6 @@ class KPlanesField(Field):
         features = interpolate_kplanes(
             positions,
             ms_grids=self.grids,  # type: ignore
-            grid_dimensions=self.grid_config[0]["grid_dimensions"],  # type: ignore
             concat_features=self.concat_features_across_scales,
         )
 

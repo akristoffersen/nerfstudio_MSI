@@ -37,7 +37,7 @@ class KPlanesDensityField(Field):
             activation = "None"
 
         self.grids = init_grid_param(
-            grid_nd=2, in_dim=num_input_coords, out_dim=num_output_coords, reso=resolution, a=0.1, b=0.15
+            in_dim=num_input_coords, out_dim=num_output_coords, reso=resolution, a=0.1, b=0.15
         )
         self.sigma_net = tcnn.Network(
             n_input_dims=self.feature_dim,
@@ -70,7 +70,7 @@ class KPlanesDensityField(Field):
         positions = positions.reshape(-1, positions.shape[-1])
 
         features = interpolate_kplanes(
-            positions, ms_grids=[self.grids], grid_dimensions=2, concat_features=False,
+            positions, ms_grids=[self.grids], concat_features=False,
         )
         density = trunc_exp(
             self.sigma_net(features).to(positions)
