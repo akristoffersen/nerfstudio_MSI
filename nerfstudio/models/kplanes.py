@@ -35,7 +35,6 @@ from nerfstudio.engine.callbacks import (
     TrainingCallbackAttributes,
     TrainingCallbackLocation,
 )
-from nerfstudio.field_components.activations import init_density_activation
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SceneContraction
 from nerfstudio.fields.kplanes_density_field import KPlanesDensityField
@@ -70,7 +69,6 @@ class KPlanesModelConfig(ModelConfig):
     )
     multiscale_res: Sequence[int] = (1, 2, 4, 8)
 
-    density_activation: str = "trunc_exp"
     concat_features_across_scales: bool = True
     linear_decoder: bool = False
     linear_decoder_layers: Optional[int] = 1
@@ -133,7 +131,6 @@ class KPlanesModel(Model):
         self.concat_features_across_scales = self.config.concat_features_across_scales
         self.linear_decoder = self.config.linear_decoder
         self.linear_decoder_layers = self.config.linear_decoder_layers
-        self.density_act = init_density_activation(self.config.density_activation)
 
         self.scene_contraction = SceneContraction(order=float("inf"))
 
@@ -145,7 +142,6 @@ class KPlanesModel(Model):
             use_appearance_embedding=self.config.use_appearance_embedding,
             appearance_dim=self.config.appearance_embedding_dim,
             spatial_distortion=self.scene_contraction,
-            density_activation=self.density_act,
             linear_decoder=self.linear_decoder,
             linear_decoder_layers=self.linear_decoder_layers,
             num_images=self.num_train_data,
@@ -168,7 +164,6 @@ class KPlanesModel(Model):
             network = KPlanesDensityField(
                 self.scene_box.aabb,
                 spatial_distortion=self.scene_contraction,
-                density_activation=self.density_act,
                 linear_decoder=self.linear_decoder,
                 **prop_net_args,
             )
@@ -180,7 +175,6 @@ class KPlanesModel(Model):
                 network = KPlanesDensityField(
                     self.scene_box.aabb,
                     spatial_distortion=self.scene_contraction,
-                    density_activation=self.density_act,
                     linear_decoder=self.linear_decoder,
                     **prop_net_args,
                 )

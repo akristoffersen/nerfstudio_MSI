@@ -1,4 +1,4 @@
-from typing import Callable, Optional
+from typing import Optional
 
 import tinycudann as tcnn
 import torch
@@ -7,6 +7,7 @@ from torchtyping import TensorType
 
 from nerfstudio.cameras.rays import RaySamples
 from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.field_components.activations import trunc_exp
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
 from nerfstudio.fields.base_field import Field
@@ -22,7 +23,6 @@ class KPlanesDensityField(Field):
         resolution,
         num_input_coords,
         num_output_coords,
-        density_activation: Callable,
         spatial_distortion: Optional[SpatialDistortion] = None,
         linear_decoder: bool = True,
     ) -> None:
@@ -32,7 +32,6 @@ class KPlanesDensityField(Field):
         self.linear_decoder = linear_decoder
         self.hexplane = num_input_coords == 4
         self.feature_dim = num_output_coords
-        self.density_activation = density_activation
         self.linear_decoder = linear_decoder
         activation = "ReLU"
         if self.linear_decoder:
@@ -75,7 +74,7 @@ class KPlanesDensityField(Field):
         features = interpolate_ms_features(
             pts, ms_grids=[self.grids], grid_dimensions=2, concat_features=False, num_levels=None
         )
-        density = self.density_activation(
+        density = trunc_exp(
             self.sigma_net(features).to(pts)
             # features.to(pts)
         ).view(n_rays, n_samples, 1)

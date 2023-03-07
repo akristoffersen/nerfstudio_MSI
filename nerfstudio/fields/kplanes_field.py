@@ -16,7 +16,7 @@
 
 
 import itertools
-from typing import Callable, Collection, Dict, Iterable, List, Optional, Sequence, Union
+from typing import  Collection, Dict, Iterable, List, Optional, Sequence, Union
 
 import tinycudann as tcnn
 import torch
@@ -26,6 +26,7 @@ from torchtyping import TensorType
 
 from nerfstudio.cameras.rays import RaySamples
 from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.field_components.activations import trunc_exp
 from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
@@ -118,7 +119,6 @@ class KPlanesField(Field):
         spatial_distortion: Optional[SpatialDistortion] = None,
         grid_config: Union[str, List[Dict]] = "",
         num_images: int = 0,
-        density_activation: Optional[Callable] = None,
         multiscale_res: Optional[Sequence[int]] = None,
         concat_features_across_scales: bool = False,
         linear_decoder: bool = True,
@@ -135,7 +135,6 @@ class KPlanesField(Field):
         self.multiscale_res_multipliers: List[int] = multiscale_res or [1]  # type: ignore
 
         self.concat_features = concat_features_across_scales
-        self.density_activation = density_activation
         self.linear_decoder = linear_decoder
 
         # 1. Init planes
@@ -280,7 +279,7 @@ class KPlanesField(Field):
             features = self.sigma_net(features)
             features, density_before_activation = torch.split(features, [self.geo_feat_dim, 1], dim=-1)
 
-        density = self.density_activation(density_before_activation.to(pts)).view(n_rays, n_samples, 1)  # type: ignore
+        density = trunc_exp(density_before_activation.to(pts)).view(n_rays, n_samples, 1)  # type: ignore
         return density, features
 
     def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[TensorType] = None) -> TensorType:
