@@ -10,7 +10,7 @@ from nerfstudio.data.scene_box import SceneBox
 from nerfstudio.field_components.activations import trunc_exp
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
 from nerfstudio.fields.base_field import Field
-from nerfstudio.fields.kplanes_field import init_grid_param, interpolate_ms_features
+from nerfstudio.fields.kplanes_field import init_grid_param, interpolate_kplanes
 
 
 class KPlanesDensityField(Field):
@@ -69,8 +69,8 @@ class KPlanesDensityField(Field):
 
         positions = positions.reshape(-1, positions.shape[-1])
 
-        features = interpolate_ms_features(
-            positions, ms_grids=[self.grids], grid_dimensions=2, concat_features=False, num_levels=None
+        features = interpolate_kplanes(
+            positions, ms_grids=[self.grids], grid_dimensions=2, concat_features=False,
         )
         density = trunc_exp(
             self.sigma_net(features).to(positions)
