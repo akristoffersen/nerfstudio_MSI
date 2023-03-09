@@ -19,7 +19,7 @@ K-Planes implementation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Type
+from typing import Dict, List, Optional, Sequence, Tuple, Type, Literal
 
 import numpy as np
 import torch
@@ -77,6 +77,8 @@ class KPlanesModelConfig(ModelConfig):
     """Whether to use a fully linear decoder, or a non-linear MLP for decoding"""
     linear_decoder_layers: Optional[int] = 1
     """Number of layers in the linear decoder"""
+    background_color: Literal["black", "last_sample", "white", "random"] = "last_sample"
+    """The background color that is given to untrained areas."""
     # proposal-sampling arguments
     num_proposal_iterations: int = 2
     """Number of proposal network iterations."""
@@ -191,7 +193,7 @@ class KPlanesModel(Model):
         self.collider = NearFarCollider(near_plane=self.config.near_plane, far_plane=self.config.far_plane)
 
         # renderers
-        self.renderer_rgb = RGBRenderer(background_color=colors.BLACK)
+        self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_accumulation = AccumulationRenderer()
         self.renderer_depth = DepthRenderer()
 
