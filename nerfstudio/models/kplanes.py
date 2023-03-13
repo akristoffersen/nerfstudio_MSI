@@ -38,7 +38,14 @@ from nerfstudio.engine.callbacks import (
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SceneContraction
 from nerfstudio.fields.kplanes_field import KPlanesField, KPlanesDensityField
-from nerfstudio.model_components.losses import MSELoss, distortion_loss, interlevel_loss
+from nerfstudio.model_components.losses import (
+    MSELoss,
+    distortion_loss,
+    interlevel_loss,
+    space_tv_loss,
+    time_smoothness_loss,
+    sparse_transients_loss,
+)
 from nerfstudio.model_components.ray_samplers import ProposalNetworkSampler
 from nerfstudio.model_components.renderers import (
     AccumulationRenderer,
@@ -114,11 +121,19 @@ class KPlanesModelConfig(ModelConfig):
     """Size of the appearance vectors, only if use_appearance_embedding is True"""
     disable_viewing_dependent: bool = False
     """If true, color is independent of viewing direction. (Neural Decoder Only)"""
-    loss_coefficients: Dict[str, float] = to_immutable_dict({
-        "rgb_loss": 1.0,
-        "interlevel_loss": 1.0,
-        "distortion_loss": 0.001,
-    })
+    loss_coefficients: Dict[str, float] = to_immutable_dict(
+        {
+            "rgb_loss": 1.0,                            # Reconstruction Loss
+            "interlevel_loss": 1.0,                     # Online distillation between the proposal and nerf networks.
+            "distortion_loss": 0.001,                   # Encourage compact ray weights
+            "space_tv_loss": 0.0002,                    # Encourage sparse gradients.
+            "time_smoothness_loss": 0.001,              # Penalize acceleration.
+            "sparse_transients_loss": 0.0001,           # Enforce separation of time and space planes.
+            "space_tv_proposal_loss": 0.0002,           # Encourage sparse gradients. (for proposal grids)
+            "time_smoothness_proposal_loss": 0.001,     # Penalize acceleration. (for proposal grids)
+            "sparse_transients_proposal_loss": 0.00001, # Enforce separation of time and space planes. (for proposal grids)
+        }
+    )
     """Loss specific weights."""
 
 
@@ -205,6 +220,9 @@ class KPlanesModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
 
+        # Toggle dynamic viewer
+        self.temporal_distortion = len(self.config.spacetime_resolution) == 4
+
     def get_param_groups(self) -> Dict[str, List[Parameter]]:
         param_groups = {
             "proposal_networks": list(self.proposal_networks.parameters()),
@@ -285,18 +303,34 @@ class KPlanesModel(Model):
         image = batch["image"].to(device)
 
         rgb_loss = self.rgb_loss(image, outputs["rgb"])
+
         loss_dict = {"rgb_loss": rgb_loss}
         loss_coef = self.config.loss_coefficients
 
         if self.training:
             if "distortion_loss" in loss_coef:
-                loss_dict["distortion_loss"] = distortion_loss(
-                    outputs["weights_list"], outputs["ray_samples_list"]
-                )
+                loss_dict["distortion_loss"] = distortion_loss(outputs["weights_list"], outputs["ray_samples_list"])
             if "interlevel_loss" in loss_coef:
-                loss_dict["interlevel_loss"] = interlevel_loss(
-                    outputs["weights_list"], outputs["ray_samples_list"]
-                )
+                loss_dict["interlevel_loss"] = interlevel_loss(outputs["weights_list"], outputs["ray_samples_list"])
+
+            # Field and proposal grids.
+            ms_grids_nerf = self.field.grids
+            ms_grids_prop = [p.grids for p in self.proposal_networks]
+
+            if "space_tv_loss" in loss_coef:
+                loss_dict["space_tv_loss"] = space_tv_loss(ms_grids_nerf)
+            if "space_tv_proposal_loss" in loss_coef:
+                loss_dict["space_tv_proposal_loss"] = space_tv_loss(ms_grids_prop)
+            # Time losses
+            if len(self.config.spacetime_resolution) > 3:
+                if "sparse_transients_loss" in loss_coef:
+                    loss_dict["sparse_transients_loss"] = sparse_transients_loss(ms_grids_nerf)
+                if "sparse_transients_proposal_loss" in loss_coef:
+                    loss_dict["sparse_transients_proposal_loss"] = sparse_transients_loss(ms_grids_prop)
+                if "time_smoothness_loss" in loss_coef:
+                    loss_dict["time_smoothness_loss"] = time_smoothness_loss(ms_grids_nerf)
+                if "time_smoothness_proposal_loss" in loss_coef:
+                    loss_dict["time_smoothness_proposal_loss"] = time_smoothness_loss(ms_grids_prop)
 
         loss_dict = misc.scale_dict(loss_dict, loss_coef)
         return loss_dict
