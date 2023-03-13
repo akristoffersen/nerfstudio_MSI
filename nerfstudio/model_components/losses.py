@@ -308,3 +308,101 @@ def depth_loss(
         return urban_radiance_field_depth_loss(weights, termination_depth, predicted_depth, steps, sigma)
 
     raise NotImplementedError("Provided depth loss type not implemented.")
+
+# K-Planes losses
+def compute_plane_tv(t):
+    """
+    Compute the total variation of a tensor
+
+    https://github.com/sarafridov/K-Planes/blob/main/plenoxels/runners/regularization.py#L16
+    """
+    batch_size, c, h, w = t.shape
+    count_h = batch_size * c * (h - 1) * w
+    count_w = batch_size * c * h * (w - 1)
+    h_tv = torch.square(t[..., 1:, :] - t[..., : h - 1, :]).sum()
+    w_tv = torch.square(t[..., :, 1:] - t[..., :, : w - 1]).sum()
+    return 2 * (h_tv / count_h + w_tv / count_w)  # This is summing over batch and c instead of avg
+
+
+def compute_plane_smoothness(t):
+    """
+    Compute the smoothness of a tensor
+
+    https://github.com/sarafridov/K-Planes/blob/main/plenoxels/runners/regularization.py#L25
+    """
+    _, _, h, _ = t.shape
+    # Convolve with a second derivative filter, in the time dimension which is dimension 2
+    first_difference = t[..., 1:, :] - t[..., : h - 1, :]  # [batch, c, h-1, w]
+    second_difference = first_difference[..., 1:, :] - first_difference[..., : h - 2, :]  # [batch, c, h-2, w]
+    # Take the L2 norm of the result
+    return torch.square(second_difference).mean()
+
+
+def space_tv_loss(multi_res_grids):
+    """
+    1. Total variation in space.
+        Spatial total variation regularization encourages sparse gradients, encoding the prior that
+        edges are sparse in space. We encourage this in 1D over the
+        spatial dimensions of each of our space-time planes and in
+        2D over our space-only planes.
+
+    https://github.com/sarafridov/K-Planes/blob/main/plenoxels/runners/regularization.py#L61
+    """
+    total = 0.0
+    for grids in multi_res_grids:
+        if len(grids) == 3:
+            spatial_grids = [0, 1, 2]
+        else:
+            spatial_grids = [0, 1, 3]  # These are the spatial grids; the others are spatiotemporal
+        for grid_id in spatial_grids:
+            total += compute_plane_tv(grids[grid_id])
+        for grid in grids:
+            total += compute_plane_tv(grid)
+    return total
+
+
+def time_smoothness_loss(multi_res_grids) -> torch.Tensor:
+    """
+    2. Smoothness in time
+        We encourage smooth motion with
+        a 1D Laplacian (second derivative) filter
+        to penalize sharp “acceleration” over time. We only apply
+        this regularizer on the time dimension of our space-time
+        planes.
+
+    https://github.com/sarafridov/K-Planes/blob/main/plenoxels/runners/regularization.py#L96
+    """
+    total = 0.0
+    for grids in multi_res_grids:
+        if len(grids) == 3:
+            time_grids = []
+        else:
+            time_grids = [2, 4, 5]
+        for grid_id in time_grids:
+            total += compute_plane_smoothness(grids[grid_id])
+    return torch.as_tensor(total)
+
+
+def sparse_transients_loss(multi_res_grids) -> torch.Tensor:
+    """
+    3. Sparse transients.
+        We want the static part of the scene
+        to be modeled by the space-only planes. We encourage this
+        separation of space and time by initializing the features in
+        the space-time planes as 1 (the multiplicative identity) and
+        using an L1 regularizer on these planes during training.
+        In this way, the space-time plane features of the k-planes
+        decomposition will remain fixed at 1 if the corresponding
+        spatial content does not change over time
+
+    https://github.com/sarafridov/K-Planes/blob/main/plenoxels/runners/regularization.py#L200
+    """
+    total = 0.0
+    for grids in multi_res_grids:
+        if len(grids) == 3:
+            continue
+        spatiotemporal_grids = [2, 4, 5]
+        for grid_id in spatiotemporal_grids:
+            total += torch.abs(1 - grids[grid_id]).mean()
+    return torch.as_tensor(total)
+
