@@ -1,4 +1,4 @@
-# Copyright 2022 The Nerfstudio Team. All rights reserved.
+# Copyright 2023 The Nerfstudio Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +13,13 @@
 # limitations under the License.
 
 """
-TensorRF implementation.
+K-Planes implementation.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple, Type, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Type, Literal
 
 import numpy as np
 import torch
@@ -35,11 +35,9 @@ from nerfstudio.engine.callbacks import (
     TrainingCallbackAttributes,
     TrainingCallbackLocation,
 )
-from nerfstudio.field_components.activations import init_density_activation
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SceneContraction
-from nerfstudio.fields.kplanes_density_field import KPlanesDensityField
-from nerfstudio.fields.kplanes_field import KPlanesField
+from nerfstudio.fields.kplanes_field import KPlanesField, KPlanesDensityField
 from nerfstudio.model_components.losses import MSELoss, distortion_loss, interlevel_loss
 from nerfstudio.model_components.ray_samplers import ProposalNetworkSampler
 from nerfstudio.model_components.renderers import (
@@ -47,7 +45,7 @@ from nerfstudio.model_components.renderers import (
     DepthRenderer,
     RGBRenderer,
 )
-from nerfstudio.model_components.scene_colliders import AABBBoxCollider
+from nerfstudio.model_components.scene_colliders import NearFarCollider
 from nerfstudio.models.base_model import Model, ModelConfig
 from nerfstudio.utils import colormaps, colors, misc
 
@@ -58,151 +56,144 @@ class KPlanesModelConfig(ModelConfig):
 
     _target: Type = field(default_factory=lambda: KPlanesModel)
     """target class to instantiate"""
-    grid_config: List[Dict] = field(
-        default_factory=lambda: [
-            {
-                "grid_dimensions": 2,
-                "input_coordinate_dim": 4,
-                "output_coordinate_dim": 16,
-                "resolution": [64, 64, 64, 150],
-            },
-        ]
-    )
+    near_plane: float = 0.05
+    """How far along the ray to start sampling."""
+    far_plane: float = 1000.0
+    """How far along the ray to stop sampling."""
+    spacetime_resolution: Sequence[int] = (256, 256, 256, 150)
+    """Desired resolution of the scene at the base scale. Should include 3 or 4 elements depending
+       on whether the scene is static or dynamic.
+    """
+    feature_dim: int = 32
+    """Size of the features stored in the k-planes"""
     multiscale_res: Sequence[int] = (1, 2, 4, 8)
-
-    density_activation: str = "trunc_exp"
+    """Multipliers for the spatial resolution of the k-planes. 
+        E.g. if equals to (2, 4) and spacetime_resolution is (128, 128, 128, 50), then
+        2 k-plane models will be created at resolutions (256, 256, 256, 50) and (512, 512, 512, 50).
+    """
     concat_features_across_scales: bool = True
+    """Whether to concatenate or sum together the interpolated features at different scales"""
     linear_decoder: bool = False
+    """Whether to use a fully linear decoder, or a non-linear MLP for decoding"""
     linear_decoder_layers: Optional[int] = 1
-    # Spatial distortion
-    global_translation: Optional[torch.Tensor] = None
-    global_scale: Optional[torch.Tensor] = None
+    """Number of layers in the linear decoder"""
+    background_color: Literal["black", "last_sample", "white", "random"] = "last_sample"
+    """The background color that is given to untrained areas."""
     # proposal-sampling arguments
     num_proposal_iterations: int = 2
+    """Number of proposal network iterations."""
     use_same_proposal_network: bool = False
+    """Use the same proposal network. Otherwise use different ones."""
     proposal_net_args_list: List[Dict] = field(
         default_factory=lambda: [
-            {"num_input_coords": 4, "num_output_coords": 8, "resolution": [128, 128, 128, 150]},
-            {"num_input_coords": 4, "num_output_coords": 8, "resolution": [256, 256, 256, 150]},
+            {"feature_dim": 8, "resolution": [128, 128, 128, 150]},
+            {"feature_dim": 8, "resolution": [256, 256, 256, 150]},
         ]
     )
-    num_proposal_samples: Optional[Tuple[int, int]] = (256, 128)
-    # num_samples: Optional[int] = None
-    single_jitter: bool = False
-    proposal_warmup: int = 5000
-    proposal_update_every: int = 5
-    use_proposal_weight_anneal: bool = True
-    proposal_weights_anneal_max_num_iters: int = 1000
-    proposal_weights_anneal_slope: float = 10.0
-    # appearance embedding (phototourism)
-    use_appearance_embedding: bool = False
-    appearance_embedding_dim: int = 0
-    disable_viewing_dependent: bool = False 
-    """If true, color is independent of viewing direction. (Neural Decoder Only)"""
-    num_images: Optional[int] = None
-    num_proposal_samples_per_ray: Tuple[int, ...] = (256, 96)
-    """Number of samples per ray for each proposal network."""
+    """Arguments for the proposal density fields."""
     num_nerf_samples_per_ray: int = 48
     """Number of samples per ray for the nerf network."""
-    loss_coefficients: Dict[str, float] = to_immutable_dict({"rgb_loss": 1.0})
+    num_proposal_samples_per_ray: Tuple[int, ...] = (256, 96)
+    """Number of samples per ray for each proposal network."""
+    use_single_jitter: bool = False
+    """Whether use single jitter or not for the proposal networks."""
+    proposal_warmup: int = 5000
+    """Scales n from 1 to proposal_update_every over this many steps"""
+    proposal_update_every: int = 5
+    """Sample every n steps after the warmup"""
+    use_proposal_weight_anneal: bool = True
+    """Whether to use proposal weight annealing."""
+    proposal_weights_anneal_max_num_iters: int = 1000
+    """Max num iterations for the annealing function."""
+    proposal_weights_anneal_slope: float = 10.0
+    """Slope of the annealing function for the proposal weights."""
+    # appearance embedding (phototourism)
+    use_appearance_embedding: bool = False
+    """Whether to use per-image appearance embeddings"""
+    appearance_embedding_dim: int = 0
+    """Size of the appearance vectors, only if use_appearance_embedding is True"""
+    disable_viewing_dependent: bool = False
+    """If true, color is independent of viewing direction. (Neural Decoder Only)"""
+    loss_coefficients: Dict[str, float] = to_immutable_dict({
+        "rgb_loss": 1.0,
+        "interlevel_loss": 1.0,
+        "distortion_loss": 0.001,
+    })
     """Loss specific weights."""
-    interlevel_loss_mult: float = 1.0
-    """Proposal loss multiplier."""
-    distortion_loss_mult: float = 0.002
-    """Distortion loss multiplier."""
 
 
 class KPlanesModel(Model):
+    config: KPlanesModelConfig
     """K-Planes Model
 
     Args:
         config: K-Planes configuration to instantiate model
     """
 
-    config: KPlanesModelConfig
-
     def populate_modules(self):
         """Set the fields and modules"""
         super().populate_modules()
 
-        if isinstance(self.config.grid_config, str):
-            self.grid_config: Sequence[Dict] = eval(self.config.grid_config)
-        else:
-            self.grid_config: Sequence[Dict] = self.config.grid_config
-
-        self.concat_features_across_scales = self.config.concat_features_across_scales
-        self.linear_decoder = self.config.linear_decoder
-        self.linear_decoder_layers = self.config.linear_decoder_layers
-        self.density_act = init_density_activation(self.config.density_activation)
-
-        self.scene_contraction = SceneContraction(order=float("inf"))
+        linear_decoder = self.config.linear_decoder
+        scene_contraction = SceneContraction(order=float("inf"))
 
         self.field = KPlanesField(
             self.scene_box.aabb,
-            grid_config=self.grid_config,
-            concat_features_across_scales=self.concat_features_across_scales,
+            feat_dim=self.config.feature_dim,
+            spacetime_resolution=self.config.spacetime_resolution,
+            concat_features_across_scales=self.config.concat_features_across_scales,
             multiscale_res=self.config.multiscale_res,
             use_appearance_embedding=self.config.use_appearance_embedding,
             appearance_dim=self.config.appearance_embedding_dim,
-            spatial_distortion=self.scene_contraction,
-            density_activation=self.density_act,
-            linear_decoder=self.linear_decoder,
-            linear_decoder_layers=self.linear_decoder_layers,
+            spatial_distortion=scene_contraction,
+            linear_decoder=linear_decoder,
+            linear_decoder_layers=self.config.linear_decoder_layers,
             num_images=self.num_train_data,
             disable_viewing_dependent=self.config.disable_viewing_dependent,
         )
 
         self.density_fns = []
-        self.num_proposal_iterations = self.config.num_proposal_iterations
-        self.proposal_net_args_list = self.config.proposal_net_args_list
-        self.proposal_warmup = self.config.proposal_warmup
-        self.proposal_update_every = self.config.proposal_update_every
-        self.use_proposal_weight_anneal = self.config.use_proposal_weight_anneal
-        self.proposal_weights_anneal_max_num_iters = self.config.proposal_weights_anneal_max_num_iters
-        self.proposal_weights_anneal_slope = self.config.proposal_weights_anneal_slope
+        num_prop_nets = self.config.num_proposal_iterations
+        # Build the proposal network(s)
         self.proposal_networks = torch.nn.ModuleList()
-
         if self.config.use_same_proposal_network:
-            assert len(self.proposal_net_args_list) == 1, "Only one proposal network is allowed."
-            prop_net_args = self.proposal_net_args_list[0]
+            assert len(self.config.proposal_net_args_list) == 1, "Only one proposal network is allowed."
+            prop_net_args = self.config.proposal_net_args_list[0]
             network = KPlanesDensityField(
-                self.scene_box.aabb,
-                spatial_distortion=self.scene_contraction,
-                density_activation=self.density_act,
-                linear_decoder=self.linear_decoder,
-                **prop_net_args,
-            )
+                self.scene_box.aabb, spatial_distortion=scene_contraction,
+                linear_decoder=linear_decoder, **prop_net_args)
             self.proposal_networks.append(network)
-            self.density_fns.extend([network.density_fn for _ in range(self.num_proposal_iterations)])
+            self.density_fns.extend([network.density_fn for _ in range(num_prop_nets)])
         else:
-            for i in range(self.num_proposal_iterations):
-                prop_net_args = self.proposal_net_args_list[min(i, len(self.proposal_net_args_list) - 1)]
+            for i in range(num_prop_nets):
+                prop_net_args = self.config.proposal_net_args_list[min(i, len(self.config.proposal_net_args_list) - 1)]
                 network = KPlanesDensityField(
-                    self.scene_box.aabb,
-                    spatial_distortion=self.scene_contraction,
-                    density_activation=self.density_act,
-                    linear_decoder=self.linear_decoder,
-                    **prop_net_args,
-                )
+                    self.scene_box.aabb, spatial_distortion=scene_contraction,
+                    linear_decoder=linear_decoder, **prop_net_args)
                 self.proposal_networks.append(network)
             self.density_fns.extend([network.density_fn for network in self.proposal_networks])
 
-        update_schedule = lambda step: np.clip(
-            np.interp(step, [0, self.proposal_warmup], [0, self.proposal_update_every]),
-            1,
-            self.proposal_update_every,
-        )
+        # Samplers
+        def update_schedule(step):
+            return np.clip(
+                np.interp(step, [0, self.config.proposal_warmup], [0, self.config.proposal_update_every]),
+                1,
+                self.config.proposal_update_every,
+            )
 
         self.proposal_sampler = ProposalNetworkSampler(
             num_nerf_samples_per_ray=self.config.num_nerf_samples_per_ray,
             num_proposal_samples_per_ray=self.config.num_proposal_samples_per_ray,
             num_proposal_network_iterations=self.config.num_proposal_iterations,
-            single_jitter=self.config.single_jitter,
+            single_jitter=self.config.use_single_jitter,
             update_sched=update_schedule,
         )
 
+        # Collider
+        self.collider = NearFarCollider(near_plane=self.config.near_plane, far_plane=self.config.far_plane)
+
         # renderers
-        self.renderer_rgb = RGBRenderer(background_color=colors.BLACK)
+        self.renderer_rgb = RGBRenderer(background_color=self.config.background_color)
         self.renderer_accumulation = AccumulationRenderer()
         self.renderer_depth = DepthRenderer()
 
@@ -214,9 +205,12 @@ class KPlanesModel(Model):
         self.ssim = structural_similarity_index_measure
         self.lpips = LearnedPerceptualImagePatchSimilarity()
 
-        # colliders
-        if self.config.enable_collider:
-            self.collider = AABBBoxCollider(scene_box=self.scene_box)
+    def get_param_groups(self) -> Dict[str, List[Parameter]]:
+        param_groups = {
+            "proposal_networks": list(self.proposal_networks.parameters()),
+            "fields": list(self.field.parameters())
+        }
+        return param_groups
 
     def get_training_callbacks(
         self, training_callback_attributes: TrainingCallbackAttributes
@@ -249,42 +243,17 @@ class KPlanesModel(Model):
             )
         return callbacks
 
-    def get_param_groups(self) -> Dict[str, List[Parameter]]:
-
-        model_params = self.field.get_params()
-        pn_params = [pn.get_params() for pn in self.proposal_networks]
-        field_params = model_params["field"] + [p for pnp in pn_params for p in pnp["field"]]
-        nn_params = model_params["nn"] + [p for pnp in pn_params for p in pnp["nn"]]
-        other_params = model_params["other"] + [p for pnp in pn_params for p in pnp["other"]]
-
-        return {
-            "fields": field_params,
-            "nn_params": nn_params,
-            # "other": other_params,
-        }
-
     def get_outputs(self, ray_bundle: RayBundle):
-        # uniform sampling
-
-        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(ray_bundle, density_fns=self.density_fns)
+        ray_samples, weights_list, ray_samples_list = self.proposal_sampler(
+            ray_bundle, density_fns=self.density_fns
+        )
         field_out = self.field(ray_samples)
-        rgb, density = field_out[FieldHeadNames.RGB], field_out[FieldHeadNames.DENSITY]
 
-        # print("rgb 0", rgb.isnan().any())
-        # print("density 0", density.isnan().any())
-
-        weights = ray_samples.get_weights(density)
+        weights = ray_samples.get_weights(field_out[FieldHeadNames.DENSITY])
         weights_list.append(weights)
         ray_samples_list.append(ray_samples)
 
-        rgb = self.renderer_rgb(
-            rgb=rgb,
-            weights=weights,
-        )
-
-        # print("rgb 1", rgb.isnan().any())
-        # print("weights 1", weights.isnan().any())
-
+        rgb = self.renderer_rgb(rgb=field_out[FieldHeadNames.RGB], weights=weights)
         accumulation = self.renderer_accumulation(weights)
         depth = self.renderer_depth(weights, ray_samples)
 
@@ -298,36 +267,38 @@ class KPlanesModel(Model):
             outputs["weights_list"] = weights_list
             outputs["ray_samples_list"] = ray_samples_list
 
-        for i in range(self.num_proposal_iterations):
-            outputs[f"prop_depth_{i}"] = self.renderer_depth(weights=weights_list[i], ray_samples=ray_samples_list[i])
+        for i in range(self.config.num_proposal_iterations):
+            outputs[f"prop_depth_{i}"] = self.renderer_depth(
+                weights=weights_list[i], ray_samples=ray_samples_list[i]
+            )
 
         return outputs
 
+    def get_metrics_dict(self, outputs, batch):
+        metrics_dict = {}
+        image = batch["image"].to(self.device)
+        metrics_dict["psnr"] = self.psnr(outputs["rgb"], image)
+        return metrics_dict
+
     def get_loss_dict(self, outputs, batch, metrics_dict=None) -> Dict[str, torch.Tensor]:
-        # Scaling metrics by coefficients to create the losses.
         device = outputs["rgb"].device
         image = batch["image"].to(device)
 
         rgb_loss = self.rgb_loss(image, outputs["rgb"])
-
-        # print("rgb_loss", rgb_loss.isnan().any())
-
         loss_dict = {"rgb_loss": rgb_loss}
+        loss_coef = self.config.loss_coefficients
 
         if self.training:
+            if "distortion_loss" in loss_coef:
+                loss_dict["distortion_loss"] = distortion_loss(
+                    outputs["weights_list"], outputs["ray_samples_list"]
+                )
+            if "interlevel_loss" in loss_coef:
+                loss_dict["interlevel_loss"] = interlevel_loss(
+                    outputs["weights_list"], outputs["ray_samples_list"]
+                )
 
-            loss_dict["distortion_loss"] = self.config.distortion_loss_mult * distortion_loss(
-                outputs["weights_list"], outputs["ray_samples_list"]
-            )
-            # print("dist_loss", loss_dict["distortion_loss"].isnan().any())
-
-            loss_dict["interlevel_loss"] = self.config.interlevel_loss_mult * interlevel_loss(
-                outputs["weights_list"], outputs["ray_samples_list"]
-            )
-
-            # print("interlevel_loss", loss_dict["interlevel_loss"].isnan().any())
-
-        loss_dict = misc.scale_dict(loss_dict, self.config.loss_coefficients)
+        loss_dict = misc.scale_dict(loss_dict, loss_coef)
         return loss_dict
 
     def get_image_metrics_and_images(

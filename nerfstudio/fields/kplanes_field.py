@@ -16,7 +16,7 @@
 
 
 import itertools
-from typing import Callable, Collection, Dict, Iterable, List, Optional, Sequence, Union
+from typing import Collection, Iterable, Optional, Sequence
 
 import tinycudann as tcnn
 import torch
@@ -26,6 +26,7 @@ from torchtyping import TensorType
 
 from nerfstudio.cameras.rays import RaySamples
 from nerfstudio.data.scene_box import SceneBox
+from nerfstudio.field_components.activations import trunc_exp
 from nerfstudio.field_components.embedding import Embedding
 from nerfstudio.field_components.field_heads import FieldHeadNames
 from nerfstudio.field_components.spatial_distortions import SpatialDistortion
@@ -33,51 +34,61 @@ from nerfstudio.fields.base_field import Field
 from nerfstudio.utils.interpolation import grid_sample_wrapper
 
 
-def get_normalized_directions(directions):
+def get_normalized_directions(directions: TensorType["bs":..., 3]):
     """SH encoding must be in the range [0, 1]
+
     Args:
         directions: batch of directions
     """
     return (directions + 1.0) / 2.0
 
 
-def normalize_aabb(pts, aabb):
-    """TODO"""
-    return (pts - aabb[0]) * (2.0 / (aabb[1] - aabb[0])) - 1.0
+def init_kplanes_field(out_dim: int, reso: Sequence[int], a: float = 0.1, b: float = 0.5) -> nn.ParameterList:
+    """Initialize feature planes at a single scale.
 
+    This functions creates k-choose-2 planes, where k is the number of input coordinates (4 for
+    video, 3 for static scenes). k is inferred from the length of the `resolution` sequence.
 
-def init_grid_param(grid_nd: int, in_dim: int, out_dim: int, reso: Sequence[int], a: float = 0.1, b: float = 0.5):
-    """TODO"""
-    assert in_dim == len(reso), "Resolution must have same number of elements as input-dimension"
+    Args:
+        out_dim: feature size at every point of the planes
+        reso: the resolution of the planes, must be of length 3 or 4
+        a: the spatial planes are initialized uniformly at random between `a` and `b`
+        b: the spatial planes are initialized uniformly at random between `a` and `b`
+    """
+    in_dim = len(reso)
     has_time_planes = in_dim == 4
-    assert grid_nd <= in_dim
-    coo_combs = list(itertools.combinations(range(in_dim), grid_nd))
+    coo_combs = list(itertools.combinations(range(in_dim), 2))
     grid_coefs = nn.ParameterList()
     for ci, coo_comb in enumerate(coo_combs):
-        new_grid_coef = nn.Parameter(torch.empty([1, out_dim] + [reso[cc] for cc in coo_comb[::-1]]))
+        new_grid_coef = nn.Parameter(torch.empty(
+            [1, out_dim] + [reso[cc] for cc in coo_comb[::-1]]
+        ))
         if has_time_planes and 3 in coo_comb:  # Initialize time planes to 1
             nn.init.ones_(new_grid_coef)
-        else:
+        else:  # Initialize spatial planes as uniform[a, b]
             nn.init.uniform_(new_grid_coef, a=a, b=b)
         grid_coefs.append(new_grid_coef)
 
     return grid_coefs
 
 
-def interpolate_ms_features(
+def interpolate_kplanes(
     pts: torch.Tensor,
     ms_grids: Collection[Iterable[nn.Module]],
-    grid_dimensions: int,
     concat_features: bool,
-    num_levels: Optional[int],
 ) -> torch.Tensor:
-    """todo"""
-    coo_combs = list(itertools.combinations(range(pts.shape[-1]), grid_dimensions))
-    if num_levels is None:
-        num_levels = len(ms_grids)
+    """K-Planes: query multi-scale planes at given points
+
+    Args:
+        pts: 3D or 4D points at which the planes are queries
+        ms_grids: Multi-scale k-plane grids
+        concat_features: If true, the features from each scale are concatenated.
+            Otherwise they are summed together.
+    """
+    coo_combs = list(itertools.combinations(range(pts.shape[-1]), 2))
     multi_scale_interp = [] if concat_features else 0.0
     grid: nn.ParameterList
-    for scale_id, grid in enumerate(ms_grids[:num_levels]):  # type: ignore
+    for scale_id, grid in enumerate(ms_grids):  # type: ignore
         interp_space = 1.0
         for ci, coo_comb in enumerate(coo_combs):
             # interpolate in plane
@@ -98,27 +109,32 @@ def interpolate_ms_features(
 
 
 class KPlanesField(Field):
-    """TensoRF Field"""
+    """KPlanes Field
+
+    Args:
+        aabb: scene aabb bounds
+        spacetime_resolution: desired resolution of the scene at the base scale
+        feat_dim: size of features stored in the k-planes
+        appearance_dim: size of the appearance vectors, only if use_appearance_embedding is True
+        spatial_distortion: spatial distortion to apply to the scene
+        num_images: number of images in the dataset. Used for appearance embedding
+        multiscale_res: list of multipliers for the spatial resolution of the k-planes
+        concat_features_across_scales: if True, features from different scales will be concatenated
+            before passing to the MLP/linear decoders. Otherwise they will be summed together
+        linear_decoder: whether to use a fully linear decoder, or a non-linear MLP for decoding
+        linear_decoder_layers: number of layers in the linear decoder
+        use_appearance_embedding: Whether to use per-image appearance embeddings
+        disable_viewing_dependent: Do not use any view-dependent effects
+    """
 
     def __init__(
         self,
         aabb,
-        # the aabb bounding box of the dataset
+        spacetime_resolution: Sequence[int] = (256, 256, 256, 150),
+        feat_dim: int = 16,
         appearance_dim: int = 27,
-        # the number of dimensions for the appearance embedding
-        head_mlp_num_layers: int = 2,
-        # number of layers for the MLP
-        head_mlp_layer_width: int = 128,
-        # layer width for the MLP
-        use_sh: bool = False,
-        # whether to use spherical harmonics as the feature decoding function
-        sh_levels: int = 2,
-        # number of levels to use for spherical harmonics
-        # added stuff
         spatial_distortion: Optional[SpatialDistortion] = None,
-        grid_config: Union[str, List[Dict]] = "",
         num_images: int = 0,
-        density_activation: Optional[Callable] = None,
         multiscale_res: Optional[Sequence[int]] = None,
         concat_features_across_scales: bool = False,
         linear_decoder: bool = True,
@@ -127,57 +143,42 @@ class KPlanesField(Field):
         disable_viewing_dependent: bool = False,
     ) -> None:
         super().__init__()
+
         self.aabb = Parameter(aabb, requires_grad=False)
         self.spatial_distortion = spatial_distortion
-        self.grid_config = grid_config
-        self.num_images = num_images
-
-        self.multiscale_res_multipliers: List[int] = multiscale_res or [1]  # type: ignore
-
-        self.concat_features = concat_features_across_scales
-        self.density_activation = density_activation
+        self.multiscale_res_multipliers: Sequence[int] = multiscale_res or [1]
+        self.concat_features_across_scales = concat_features_across_scales
         self.linear_decoder = linear_decoder
-
+        self.has_time_planes = len(spacetime_resolution) == 4
+        self.feature_dim = (
+            feat_dim * len(self.multiscale_res_multipliers)
+            if self.concat_features_across_scales
+            else feat_dim
+        )
         # 1. Init planes
         self.grids = nn.ModuleList()
-        self.feature_dim = 0
-
         for res in self.multiscale_res_multipliers:
+            resolution = [r * res for r in spacetime_resolution[:3]]
+            if len(spacetime_resolution) > 3:  # Time does not get multi-scale treatment
+                resolution.append(spacetime_resolution[3])
+            self.grids.append(init_kplanes_field(
+                out_dim=feat_dim,
+                reso=resolution,
+            ))
 
-            config = self.grid_config[0].copy()  # type: ignore
-            # Resolution fix: multi-res only on spatial planes
-            config["resolution"] = [r * res for r in config["resolution"][:3]] + config["resolution"][3:]
-            gp = init_grid_param(
-                grid_nd=config["grid_dimensions"],
-                in_dim=config["input_coordinate_dim"],
-                out_dim=config["output_coordinate_dim"],
-                reso=config["resolution"],
-            )
-            # shape[1] is out-dim - Concatenate over feature len for each scale
-            if self.concat_features:
-                self.feature_dim += gp[-1].shape[1]
-            else:
-                self.feature_dim = gp[-1].shape[1]
-            self.grids.append(gp)
-
-        # appearance embeddings
-        self.use_average_appearance_embedding = True  # for test-time
+        # Initialize appearance code-related parameters
         self.use_appearance_embedding = use_appearance_embedding
-
         self.appearance_embedding = None
+        self.appearance_embedding_dim = 0
         if use_appearance_embedding:
-            assert self.num_images is not None
+            assert num_images is not None
             self.appearance_embedding_dim = appearance_dim
             # this will initialize as normal_(0.0, 1.0)
-            self.appearance_embedding = Embedding(self.num_images, self.appearance_embedding_dim)
-        else:
-            self.appearance_embedding_dim = 0
+            self.appearance_embedding = Embedding(num_images, self.appearance_embedding_dim)
 
-        # Lambertian effects
+        # Initialize direction encoder
         self.disable_viewing_dependent = disable_viewing_dependent
-
-        if not disable_viewing_dependent:
-            # Init direction encoder
+        if not self.disable_viewing_dependent:
             self.direction_encoder = tcnn.Encoding(
                 n_input_dims=3,
                 encoding_config={
@@ -186,15 +187,14 @@ class KPlanesField(Field):
                 },
             )
 
-        # Init decoder network
+        # Initialize decoder network
         if self.linear_decoder:
             assert linear_decoder_layers is not None
             # The NN learns a basis that is used instead of spherical harmonics
             # Input is an encoded view direction, output is weights for
-            # combining the color features into RGB
-            # This architecture is based on instant-NGP
+            # combining the color features into RGB. This architecture is based on instant-NGP
             self.color_basis = tcnn.Network(
-                n_input_dims=3 + self.appearance_embedding_dim,  # self.direction_encoder.n_output_dims,
+                n_input_dims=3 + self.appearance_embedding_dim,
                 n_output_dims=3 * self.feature_dim,
                 network_config={
                     "otype": "FullyFusedMLP",
@@ -245,31 +245,27 @@ class KPlanesField(Field):
             )
 
     def get_density(self, ray_samples: RaySamples):
-
+        """Computes and returns the densities."""
+        positions = ray_samples.frustums.get_positions()
         if self.spatial_distortion is not None:
-            positions = ray_samples.frustums.get_positions()
             positions = self.spatial_distortion(positions)
-            positions = (positions + 2.0) / 4.0
+            positions = (positions + 2.0) / 4.0  # from [-2, 2] to [-1, 1]
         else:
-            positions = SceneBox.get_normalized_positions(ray_samples.frustums.get_positions(), self.aabb)
-
-        pts = positions
-        n_rays, n_samples = pts.shape[:2]
+            positions = SceneBox.get_normalized_positions(positions, self.aabb)
+        n_rays, n_samples = positions.shape[:2]
 
         timestamps = ray_samples.times
-        if timestamps is not None:
-            # print(pts.shape, timestamps.shape)
-            # timestamps = timestamps[:, None].expand(-1, n_samples)[..., None]  # [n_rays, n_samples, 1]
-            pts = torch.cat((pts, timestamps), dim=-1)  # [n_rays, n_samples, 4]
+        if self.has_time_planes and timestamps is not None:
+            # Normalize timestamps from [0, 1] to [-1, 1]
+            timestamps = (timestamps * 2) - 1
+            positions = torch.cat((positions, timestamps), dim=-1)  # [n_rays, n_samples, 4]
 
-        pts = pts.reshape(-1, pts.shape[-1])
+        positions = positions.reshape(-1, positions.shape[-1])
 
-        features = interpolate_ms_features(
-            pts,
+        features = interpolate_kplanes(
+            positions,
             ms_grids=self.grids,  # type: ignore
-            grid_dimensions=self.grid_config[0]["grid_dimensions"],  # type: ignore
-            concat_features=self.concat_features,
-            num_levels=None,
+            concat_features=self.concat_features_across_scales,
         )
 
         if len(features) < 1:
@@ -280,27 +276,45 @@ class KPlanesField(Field):
             features = self.sigma_net(features)
             features, density_before_activation = torch.split(features, [self.geo_feat_dim, 1], dim=-1)
 
-        density = self.density_activation(density_before_activation.to(pts)).view(n_rays, n_samples, 1)  # type: ignore
+        density = trunc_exp(density_before_activation.to(positions)).view(n_rays, n_samples, 1)  # type: ignore
         return density, features
 
     def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[TensorType] = None) -> TensorType:
+        assert density_embedding is not None
+        n_rays, n_samples = ray_samples.frustums.shape
 
-        pts: torch.Tensor = ray_samples.frustums.get_positions()
-        n_rays, n_samples = pts.shape[:2]
-
-        if ray_samples.camera_indices is not None:
-            camera_indices = ray_samples.camera_indices.squeeze()
-        directions: torch.Tensor = get_normalized_directions(ray_samples.frustums.directions)
-        # directions = directions.view(-1, 1, 3).expand(pts.shape).reshape(-1, 3)
-        directions = directions.reshape(-1, 3)
-        if not self.linear_decoder and not self.disable_viewing_dependent:
+        directions = ray_samples.frustums.directions.reshape(-1, 3)
+        if self.linear_decoder or self.disable_viewing_dependent:
+            color_features = [density_embedding]
+        else:
             directions = get_normalized_directions(directions)
             encoded_directions = self.direction_encoder(directions)
-            color_features = [encoded_directions, density_embedding.view(-1, self.geo_feat_dim)]
-        else:
-            color_features = [density_embedding]
+            color_features = [encoded_directions, density_embedding]
 
-        color_features = torch.cat(color_features, dim=-1)  # type: ignore
+        if self.use_appearance_embedding:
+            assert ray_samples.camera_indices is not None
+            camera_indices = ray_samples.camera_indices.squeeze()
+            if self.training:
+                embedded_appearance = self.appearance_embedding(camera_indices)
+            else:
+                # Average of appearance embeddings for test data
+                embedded_appearance = torch.ones(
+                    (*directions.shape[:-1], self.appearance_embedding_dim), device=directions.device
+                ) * self.appearance_embedding.mean(dim=0)
+
+            # expand embedded_appearance from n_rays, dim to n_rays*n_samples, dim
+            ea_dim = embedded_appearance.shape[-1]
+            embedded_appearance = (
+                embedded_appearance.view(-1, 1, ea_dim)
+                                   .expand(n_rays, n_samples, -1)
+                                   .reshape(-1, ea_dim)
+            )
+            if self.linear_decoder:
+                directions = torch.cat((directions, embedded_appearance), dim=-1)
+            else:
+                color_features.append(embedded_appearance)
+
+        color_features = torch.cat(color_features, dim=-1)
 
         if self.linear_decoder:
             basis_values = self.color_basis(directions)  # [batch, color_feature_len * 3]
@@ -311,7 +325,7 @@ class KPlanesField(Field):
         else:
             rgb = self.color_net(color_features).to(directions).view(n_rays, n_samples, 3)
 
-        return rgb  # type: ignore
+        return rgb
 
     def forward(
         self,
@@ -325,25 +339,66 @@ class KPlanesField(Field):
 
         return {FieldHeadNames.DENSITY: density, FieldHeadNames.RGB: rgb}
 
-    def get_params(self):
-        field_params = {k: v for k, v in self.grids.named_parameters(prefix="grids")}
-        if self.disable_viewing_dependent:
-            nn_params = [self.sigma_net.named_parameters(prefix="sigma_net")]
+
+class KPlanesDensityField(Field):
+    """K-Planes Density Field"""
+
+    def __init__(
+        self,
+        aabb,
+        resolution,
+        feature_dim,
+        spatial_distortion: Optional[SpatialDistortion] = None,
+        linear_decoder: bool = True,
+    ) -> None:
+        super().__init__()
+        self.aabb = Parameter(aabb, requires_grad=False)
+        self.spatial_distortion = spatial_distortion
+        self.has_time_planes = len(resolution) == 4
+        activation = "ReLU"
+        if linear_decoder:
+            activation = "None"
+
+        self.grids = init_kplanes_field(
+            out_dim=feature_dim, reso=resolution, a=0.1, b=0.15
+        )
+        self.sigma_net = tcnn.Network(
+            n_input_dims=feature_dim,
+            n_output_dims=1,
+            network_config={
+                "otype": "FullyFusedMLP",
+                "activation": activation,
+                "output_activation": "None",
+                "n_neurons": 64,
+                "n_hidden_layers": 1,
+            },
+        )
+
+    def get_density(self, ray_samples: RaySamples):
+        positions = ray_samples.frustums.get_positions()
+        if self.spatial_distortion is not None:
+            positions = self.spatial_distortion(positions)
+            positions = (positions + 2.0) / 4.0
         else:
-            nn_params = [
-                self.sigma_net.named_parameters(prefix="sigma_net"),
-                self.direction_encoder.named_parameters(prefix="direction_encoder"),
-            ]
-        if self.linear_decoder:
-            nn_params.append(self.color_basis.named_parameters(prefix="color_basis"))
-        else:
-            nn_params.append(self.color_net.named_parameters(prefix="color_net"))
-        nn_params = {k: v for plist in nn_params for k, v in plist}
-        other_params = {
-            k: v for k, v in self.named_parameters() if (k not in nn_params.keys() and k not in field_params.keys())
-        }
-        return {
-            "nn": list(nn_params.values()),
-            "field": list(field_params.values()),
-            "other": list(other_params.values()),
-        }
+            positions = SceneBox.get_normalized_positions(positions, self.aabb)
+
+        n_rays, n_samples = positions.shape[:2]
+
+        timestamps = ray_samples.times
+        if self.has_time_planes and timestamps is not None:
+            # Normalize timestamps from [0, 1] to [-1, 1]
+            timestamps = (timestamps * 2) - 1
+            positions = torch.cat((positions, timestamps), dim=-1)  # [n_rays, n_samples, 4]
+
+        positions = positions.reshape(-1, positions.shape[-1])
+
+        features = interpolate_kplanes(
+            positions, ms_grids=[self.grids], concat_features=False,
+        )
+        density = trunc_exp(
+            self.sigma_net(features).to(positions)
+        ).view(n_rays, n_samples, 1)
+        return density, features
+
+    def get_outputs(self, ray_samples: RaySamples, density_embedding: Optional[TensorType] = None):
+        return {}

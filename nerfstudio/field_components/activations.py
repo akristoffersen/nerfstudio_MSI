@@ -41,12 +41,3 @@ class _TruncExp(Function):  # pylint: disable=abstract-method
 trunc_exp = _TruncExp.apply
 """Same as torch.exp, but with the backward pass clipped to prevent vanishing/exploding
 gradients."""
-
-
-def init_density_activation(activation_type: str):
-    if activation_type == "trunc_exp":
-        return lambda x: trunc_exp(x - 1)
-    elif activation_type == "relu":
-        return F.relu
-    else:
-        raise ValueError(activation_type)
